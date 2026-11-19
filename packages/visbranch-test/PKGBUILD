@@ -1,0 +1,14 @@
+# Maintainer: realv1sta <markcaraman6@gmail.com>
+pkgname=visbranch-test
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='Test package for visbranch: installs a command that prints "test"'
+arch=('any')
+url='https://github.com/realv1sta/visbranch'
+license=('MIT')
+source=('visbranch-test.sh')
+sha256sums=('SKIP')
+
+package() {
+    install -Dm755 "$srcdir/visbranch-test.sh" "$pkgdir/usr/bin/visbranch-test"
+}

@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# visbranch pacman shim
+#
+# When `pacman -S <name>` names a package that exists as
+# $VISBRANCH_DIR/packages/<name>/PKGBUILD, build it with `makepkg -si`
+# instead of downloading a prebuilt package. Any remaining targets are
+# handed to the real pacman. Every other operation passes straight through.
+
+set -uo pipefail
+
+REAL_PACMAN=/usr/bin/pacman
+CONF=/etc/visbranch.conf
+MAKEPKG=$(command -v makepkg || true)
+
+# Install-time config, but let the environment win.
+if [[ -z ${VISBRANCH_DIR:-} && -r $CONF ]]; then
+    # shellcheck source=/dev/null
+    . "$CONF"
+fi
+
+PKGDIR=${VISBRANCH_DIR:+$VISBRANCH_DIR/packages}
+
+has_pkgbuild() {
+    [[ -n ${PKGDIR:-} && -f $PKGDIR/$1/PKGBUILD ]]
+}
+
+passthrough() {
+    exec "$REAL_PACMAN" "$@"
+}
+
+# --- parse the command line -------------------------------------------------
+op=""
+declare -a targets=()
+expect_value=0
+after_ddash=0
+
+value_opts=(
+    --dbpath --root --config --cachedir --hookdir --logfile --gpgdir
+    --arch --ignore --ignoregroup --overwrite --assume-installed
+    --print-format
+)
+
+for arg in "$@"; do
+    if (( after_ddash )); then
+        targets+=("$arg")
+        continue
+    fi
+    if (( expect_value )); then
+        expect_value=0
+        continue
+    fi
+
+    case $arg in
+        --)
+            after_ddash=1
+            ;;
+        --sync)
+            op=sync
+            ;;
+        --search | --info | --clean | --groups | --print | --sysupgrade | --downloadonly | --list)
+            op=other
+            ;;
+        --*)
+            for opt in "${value_opts[@]}"; do
+                if [[ $arg == "$opt" ]]; then
+                    expect_value=1
+                    break
+                elif [[ $arg == "$opt="* ]]; then
+                    break
+                fi
+            done
+            ;;
+        -?*)
+            # In pacman only the first letter of a short bundle is the
+            # operation; the rest are modifiers (e.g. -Syu). Sync modifiers
+            # that are not "install" (search, info, clean, ...) must not be
+            # turned into builds.
+            case ${arg:1:1} in
+                S)
+                    if [[ ${arg:2} == *[sicgpwlu]* ]]; then
+                        op=other
+                    else
+                        op=sync
+                    fi
+                    ;;
+                u) op=other ;; # -S -u written as two arguments
+                b | r) expect_value=1 ;;
+            esac
+            ;;
+        *)
+            targets+=("$arg")
+            ;;
+    esac
+done
+
+if [[ $op != sync || ${#targets[@]} -eq 0 ]]; then
+    passthrough "$@"
+fi
+
+if [[ -z ${PKGDIR:-} || ! -d $PKGDIR ]]; then
+    passthrough "$@"
+fi
+
+declare -a local_pkgs=() repo_pkgs=()
+for target in "${targets[@]}"; do
+    if has_pkgbuild "$target"; then
+        local_pkgs+=("$target")
+    else
+        repo_pkgs+=("$target")
+    fi
+done
+
+# Nothing PKGBUILD-backed in this transaction.
+if (( ${#local_pkgs[@]} == 0 )); then
+    passthrough "$@"
+fi
+
+if [[ -z $MAKEPKG ]]; then
+    printf 'visbranch: makepkg not found in PATH\n' >&2
+    exit 1
+fi
+
+# makepkg cannot run as root; drop back to the invoking user.
+declare -a runner=()
+if (( EUID == 0 )); then
+    if [[ -z ${SUDO_USER:-} || $SUDO_USER == root ]]; then
+        printf 'visbranch: makepkg cannot run as root. Run as a normal user, or use sudo so the build can be dropped to $SUDO_USER.\n' >&2
+        exit 1
+    fi
+    runner=(runuser -u "$SUDO_USER" --)
+fi
+
+# Mirror pacman --noconfirm into makepkg.
+noconfirm=0
+for arg in "$@"; do
+    case $arg in
+        --noconfirm) noconfirm=1 ;;
+        --*) ;;
+        -?*) [[ ${arg:1} == *n* ]] && noconfirm=1 ;;
+    esac
+done
+
+declare -a makeargs=("$MAKEPKG" -s -i)
+(( noconfirm )) && makeargs+=(--noconfirm)
+
+for pkg in "${local_pkgs[@]}"; do
+    printf 'visbranch: building %s from PKGBUILD\n' "$pkg" >&2
+    if ! (cd "$PKGDIR/$pkg" && "${runner[@]}" "${makeargs[@]}"); then
+        printf 'visbranch: build failed for %s\n' "$pkg" >&2
+        exit 1
+    fi
+done
+
+# Hand any real repo targets over to pacman, minus the ones we built.
+declare -a rest=()
+for arg in "$@"; do
+    keep=1
+    for pkg in "${local_pkgs[@]}"; do
+        [[ $arg == "$pkg" ]] && keep=0
+    done
+    (( keep )) && rest+=("$arg")
+done
+
+if (( ${#repo_pkgs[@]} > 0 )); then
+    exec "$REAL_PACMAN" "${rest[@]}"
+fi
+
+exit 0

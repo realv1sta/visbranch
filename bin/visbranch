@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# visbranch: list, build and update the PKGBUILD-backed packages.
+set -euo pipefail
+
+CONF=/etc/visbranch.conf
+if [[ -z ${VISBRANCH_DIR:-} && -r $CONF ]]; then
+    # shellcheck source=/dev/null
+    . "$CONF"
+fi
+
+if [[ -z ${VISBRANCH_DIR:-} ]]; then
+    # Running straight out of a clone: use the clone itself.
+    VISBRANCH_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
+fi
+
+PKGDIR=$VISBRANCH_DIR/packages
+
+usage() {
+    cat <<'EOF'
+usage: visbranch <command> [args]
+
+commands:
+  list                 list packages and whether they are installed
+  build <name> [...]   run makepkg -si in packages/<name>
+  path <name>          print the directory holding <name>'s PKGBUILD
+  update               git pull --ff-only in the visbranch checkout
+EOF
+}
+
+pkgdir_for() {
+    local name=${1:?package name required}
+    local dir=$PKGDIR/$name
+    if [[ ! -f $dir/PKGBUILD ]]; then
+        printf 'visbranch: no such package: %s\n' "$name" >&2
+        exit 1
+    fi
+    printf '%s\n' "$dir"
+}
+
+cmd=${1:-list}
+shift || true
+
+case $cmd in
+    list | ls)
+        printf '%-24s %s\n' PACKAGE VERSION
+        for dir in "$PKGDIR"/*/; do
+            [[ -f $dir/PKGBUILD ]] || continue
+            name=$(basename "$dir")
+            if installed=$(pacman -Q "$name" 2>/dev/null); then
+                printf '%-24s %s\n' "$name" "${installed#* }"
+            else
+                printf '%-24s %s\n' "$name" '(not installed)'
+            fi
+        done
+        ;;
+    build | install)
+        name=${1:?usage: visbranch build <package>}
+        shift
+        cd "$(pkgdir_for "$name")"
+        exec makepkg -si "$@"
+        ;;
+    path)
+        pkgdir_for "${1:-}"
+        ;;
+    update)
+        git -C "$VISBRANCH_DIR" pull --ff-only
+        ;;
+    -h | --help | help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 1
+        ;;
+esac
